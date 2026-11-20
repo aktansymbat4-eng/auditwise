@@ -6,7 +6,7 @@ export type TableName = 'ledger' | 'invoices' | 'payments' | 'fx' | 'policy'
 export type InteractionScenario = 'partial_fx' | 'fx_period'
 
 export interface EpisodeConfig {
-  mode?: 'train' | 'evaluation'
+  mode?: 'train' | 'evaluation' | 'closed'
   errorTypes?: Partial<Record<ErrorType, boolean>>
   includeClean?: boolean
   interactions?: InteractionScenario[]
@@ -54,7 +54,7 @@ export interface FxRecord {
 }
 
 export interface Finding {
-  type: ErrorType
+  type: string
   affected_ids: string[]
   claimed_amount_minor: number
   currency: string
@@ -374,7 +374,7 @@ function baseObservation(session: Session, result?: unknown, error?: string): Si
 export function resetEpisode(seed: number | string, config: EpisodeConfig = {}): ResetResult {
   const normalizedConfig = {
     ...config,
-    mode: config.mode ?? 'train',
+    mode: config.mode === 'closed' ? 'evaluation' : config.mode ?? 'train',
     includeClean: config.includeClean ?? true,
     pageSize: config.pageSize ?? 50,
   } satisfies Required<Pick<EpisodeConfig, 'mode' | 'includeClean' | 'pageSize'>> & EpisodeConfig
@@ -441,28 +441,41 @@ function safeCalculate(expression: string): number {
 }
 
 function normalizeIds(ids: string[]): string[] { return [...new Set(ids)].sort() }
-function evidenceMatches(given: string[], accepted: string[][]): boolean {
+function evidenceMatches(given: string[], accepted: string[][], availableIds?: Set<string>): boolean {
   const evidence = new Set(given)
+  if (availableIds && given.some((id) => !availableIds.has(id))) return false
   return accepted.some((set) => set.every((id) => evidence.has(id)))
 }
 
-export function scoreFindings(truth: TruthIssue[], findings: Finding[], inspectionSteps: number) {
-  const unmatchedTruth = new Set(truth.map((_, index) => index))
-  let tp = 0
-  let fp = 0
-  for (const finding of findings) {
-    const index = [...unmatchedTruth].find((truthIndex) => {
-      const expected = truth[truthIndex]
-      return expected.type === finding.type
-        && expected.currency === finding.currency
-        && Math.abs(expected.expected_amount_minor - finding.claimed_amount_minor) <= 1
-        && JSON.stringify(normalizeIds(expected.affected_ids)) === JSON.stringify(normalizeIds(finding.affected_ids))
-        && evidenceMatches(finding.evidence_ids, expected.acceptable_evidence)
-    })
-    if (index === undefined) fp++
-    else { tp++; unmatchedTruth.delete(index) }
+export function scoreFindings(truth: TruthIssue[], findings: Finding[], inspectionSteps: number, availableIds?: Set<string>) {
+  const truthOrder = truth.map((issue, index) => ({ issue, index })).sort((left, right) => left.issue.issue_id < right.issue.issue_id ? -1 : left.issue.issue_id > right.issue.issue_id ? 1 : 0)
+  const edges = truthOrder.map(({ issue }) => findings.flatMap((finding, index) => {
+    const matches = issue.type === finding.type
+      && issue.currency === finding.currency
+      && Math.abs(issue.expected_amount_minor - finding.claimed_amount_minor) === 0
+      && JSON.stringify(normalizeIds(issue.affected_ids)) === JSON.stringify(normalizeIds(finding.affected_ids))
+      && evidenceMatches(finding.evidence_ids, issue.acceptable_evidence, availableIds)
+    return matches ? [index] : []
+  }))
+
+  const findingToTruth = new Map<number, number>()
+  const assign = (truthIndex: number, visited: Set<number>): boolean => {
+    for (const findingIndex of edges[truthIndex]) {
+      if (visited.has(findingIndex)) continue
+      visited.add(findingIndex)
+      const previousTruth = findingToTruth.get(findingIndex)
+      if (previousTruth === undefined || assign(previousTruth, visited)) {
+        findingToTruth.set(findingIndex, truthIndex)
+        return true
+      }
+    }
+    return false
   }
-  const fn = unmatchedTruth.size
+  for (let index = truthOrder.length - 1; index >= 0; index--) assign(index, new Set())
+
+  const tp = findingToTruth.size
+  const fp = findings.length - tp
+  const fn = truth.length - tp
   const precision = tp + fp === 0 ? 0 : tp / (tp + fp)
   const recall = tp + fn === 0 ? 0 : tp / (tp + fn)
   const f1 = tp === 0 && fp === 0 && fn === 0 ? 1 : (2 * tp) / (2 * tp + fp + fn)
@@ -477,7 +490,7 @@ function validateSubmission(value: unknown): { episode_id: string; findings: Fin
   const findings = input.findings.map((item) => {
     if (!item || typeof item !== 'object') throw new Error('Invalid findings payload.')
     const finding = item as Partial<Finding>
-    if (!ERROR_TYPES.includes(finding.type as ErrorType) || !Array.isArray(finding.affected_ids) || finding.affected_ids.length === 0 || finding.affected_ids.length > 50 || finding.affected_ids.some((id) => typeof id !== 'string' || id.length > 100) || !Number.isSafeInteger(finding.claimed_amount_minor) || (finding.claimed_amount_minor as number) < 0 || typeof finding.currency !== 'string' || !/^[A-Z]{3}$/.test(finding.currency) || !Array.isArray(finding.evidence_ids) || finding.evidence_ids.length > MAX_EVIDENCE || finding.evidence_ids.some((id) => typeof id !== 'string' || id.length > 120) || typeof finding.explanation !== 'string' || !finding.explanation.trim() || finding.explanation.length > MAX_EXPLANATION) throw new Error('Invalid findings payload.')
+    if (typeof finding.type !== 'string' || !Array.isArray(finding.affected_ids) || finding.affected_ids.length === 0 || finding.affected_ids.some((id) => typeof id !== 'string') || !Number.isSafeInteger(finding.claimed_amount_minor) || typeof finding.currency !== 'string' || !Array.isArray(finding.evidence_ids) || finding.evidence_ids.length > MAX_EVIDENCE || finding.evidence_ids.some((id) => typeof id !== 'string') || typeof finding.explanation !== 'string' || finding.explanation.length > MAX_EXPLANATION) throw new Error('Invalid findings payload.')
     return finding as Finding
   })
   return { episode_id: input.episode_id, findings }
@@ -527,8 +540,7 @@ function takeAction(session: Session, action: SimulatorAction): unknown {
       const payload = validateSubmission(action.findings)
       if (payload.episode_id !== session.episodeId) throw new Error('Episode ID does not match the active episode.')
       const available = knownIds(session)
-      if (payload.findings.some((finding) => [...finding.affected_ids, ...finding.evidence_ids].some((id) => !available.has(id)))) throw new Error('Unknown record or evidence ID.')
-      return { submitted: true, findings_count: payload.findings.length, score: scoreFindings(session.data.truth, payload.findings, Math.max(0, session.stepCount - 1)) }
+      return { submitted: true, findings_count: payload.findings.length, score: scoreFindings(session.data.truth, payload.findings, Math.max(0, session.stepCount - 1), available) }
     }
     default: throw new Error('Unknown action.')
   }
