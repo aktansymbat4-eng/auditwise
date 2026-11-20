@@ -224,7 +224,7 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
   const allocationIndex = (salt + 1) % invoiceCount
   const interactionFxIndex = (salt + 2) % invoiceCount
   const periodIndex = (salt + 3) % invoiceCount
-  const cleanPairIndices = Array.from({ length: invoiceCount }, (_, index) => index)
+  const cleanPairIndices = config.includeClean === false ? [] : Array.from({ length: invoiceCount }, (_, index) => index)
     .filter((index) => ![duplicateIndex, allocationIndex, interactionFxIndex, periodIndex].includes(index))
     .slice(0, 2)
   const cleanPairAmount = Math.round((150 + rand() * 920) * 100)
@@ -240,21 +240,31 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
     const issuedDay = 2 + Math.floor(rand() * 24)
     const invoiceDate = iso(issuedDay, 12, timezone.offset)
     const paymentDate = iso(Math.min(29, issuedDay + 2), 15, timezone.offset)
-    const isAllocationIssue = enabled.payment_allocation && (index === allocationIndex || (interactions.includes('partial_fx') && index === interactionFxIndex))
+    const isMisallocationIssue = enabled.payment_allocation && index === allocationIndex
+    const isPartialPaymentIssue = enabled.payment_allocation && interactions.includes('partial_fx') && index === interactionFxIndex
+    const isAllocationIssue = isMisallocationIssue || isPartialPaymentIssue
     const isFxIssue = enabled.fx_date_rate && (index === interactionFxIndex || (interactions.includes('fx_period') && index === periodIndex))
     const isPeriodIssue = enabled.period_cutoff && index === periodIndex
     const isDuplicateIssue = enabled.duplicate_invoice && index === duplicateIndex
     const transactionCurrency = isFxIssue ? 'EUR' : currency
     const paymentCurrency = transactionCurrency
     const paymentId = `PAY-${9900 + salt * 100 + index}`
-    const paymentAmount = isAllocationIssue ? Math.round(amount * 0.62) : amount
+    const paymentAmount = isPartialPaymentIssue ? Math.round(amount * 0.62) : amount
+    const misallocatedAmount = isMisallocationIssue ? Math.round(paymentAmount * 0.38) : 0
+    const correctlyAllocatedAmount = paymentAmount - misallocatedAmount
+    const issueIndices = new Set([duplicateIndex, allocationIndex, interactionFxIndex, periodIndex])
+    const misallocatedInvoiceIndex = cleanPairIndices[1] ?? Array.from({ length: invoiceCount }, (_, candidate) => candidate).find((candidate) => candidate !== index && !issueIndices.has(candidate)) ?? (index + 1) % invoiceCount
+    const misallocatedInvoiceId = `INV-${8800 + salt * 100 + misallocatedInvoiceIndex}`
     const invoiceDoc: InvoiceDocument = {
       doc_id: `DOC-${invoiceId}`, invoice_id: invoiceId, entity_id: entityId, issued_at: invoiceDate, due_at: iso(Math.min(30, issuedDay + 14), 12, timezone.offset), currency: transactionCurrency,
       total_minor: amount, line_items: [{ description: `${vendor} services`, amount_minor: amount }],
     }
     const paymentDoc: PaymentDocument = {
       doc_id: `DOC-${paymentId}`, payment_id: paymentId, timestamp: paymentDate, currency: paymentCurrency, amount_minor: paymentAmount,
-      invoice_refs: [{ invoice_id: invoiceId, amount_minor: paymentAmount }],
+      invoice_refs: [
+        { invoice_id: invoiceId, amount_minor: correctlyAllocatedAmount },
+        ...(misallocatedAmount ? [{ invoice_id: misallocatedInvoiceId, amount_minor: misallocatedAmount }] : []),
+      ],
     }
     data.invoices.push(invoiceDoc)
     data.payments.push(paymentDoc)
@@ -265,8 +275,10 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
     entryIndex += 2
 
     if (isAllocationIssue) {
-      issues.push({ issue_id: `ISS-${invoiceId}-allocation`, type: 'payment_allocation', affected_ids: paymentRows, expected_amount_minor: amount - paymentAmount, currency: transactionCurrency, acceptable_evidence: [[...paymentRows, invoiceDoc.doc_id, paymentDoc.doc_id].sort()] })
-      data.provenance.push({ change: 'payment_amount_reduced', invoice_id: invoiceId, from_minor: amount, to_minor: paymentAmount })
+      issues.push({ issue_id: `ISS-${invoiceId}-allocation`, type: 'payment_allocation', affected_ids: paymentRows, expected_amount_minor: amount - correctlyAllocatedAmount, currency: transactionCurrency, acceptable_evidence: [[...paymentRows, invoiceDoc.doc_id, paymentDoc.doc_id].sort()] })
+      data.provenance.push(isMisallocationIssue
+        ? { change: 'payment_partially_allocated_to_wrong_invoice', invoice_id: invoiceId, misallocated_invoice_id: misallocatedInvoiceId, misallocated_amount_minor: misallocatedAmount }
+        : { change: 'payment_amount_reduced', invoice_id: invoiceId, from_minor: amount, to_minor: paymentAmount })
     }
 
     if (isDuplicateIssue) {
@@ -312,27 +324,27 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
   }
 
   // A plausible split payment and repeated invoice amounts act as clean distractors.
-  const splitInvoice = data.invoices[cleanPairIndices[0]]
-  if (splitInvoice) {
-    const splitPayment = data.payments.find((payment) => payment.invoice_refs.some((ref) => ref.invoice_id === splitInvoice.invoice_id))
-    if (splitPayment) {
-      const splitFirst = Math.floor(splitPayment.amount_minor * 0.4)
-      const splitSecond = splitPayment.amount_minor - splitFirst
-      splitPayment.amount_minor = splitFirst
-      splitPayment.invoice_refs = [{ invoice_id: splitInvoice.invoice_id, amount_minor: splitFirst }]
-      for (const row of data.ledger.filter((item) => item.payment_id === splitPayment.payment_id)) {
-        if (row.debit_minor) row.debit_minor = splitFirst
-        if (row.credit_minor) row.credit_minor = splitFirst
-      }
-      const secondId = `PAY-${9900 + salt * 100 + invoiceCount + 1}`
-      const splitDate = iso(26, 15, timezone.offset)
-      data.payments.push({ doc_id: `DOC-${secondId}`, payment_id: secondId, timestamp: splitDate, currency: splitInvoice.currency, amount_minor: splitSecond, invoice_refs: [{ invoice_id: splitInvoice.invoice_id, amount_minor: splitSecond }] })
-      const entity = splitInvoice.entity_id
-      makePair(data.ledger, entryIndex, splitDate, 'Accounts payable', 'Cash', splitSecond, splitInvoice.currency, entity, splitInvoice.invoice_id, secondId)
-      entryIndex += 2
-    }
-  }
   if (config.includeClean !== false) {
+    const splitInvoice = data.invoices[cleanPairIndices[0]]
+    if (splitInvoice) {
+      const splitPayment = data.payments.find((payment) => payment.invoice_refs.some((ref) => ref.invoice_id === splitInvoice.invoice_id))
+      if (splitPayment) {
+        const splitFirst = Math.floor(splitPayment.amount_minor * 0.4)
+        const splitSecond = splitPayment.amount_minor - splitFirst
+        splitPayment.amount_minor = splitFirst
+        splitPayment.invoice_refs = [{ invoice_id: splitInvoice.invoice_id, amount_minor: splitFirst }]
+        for (const row of data.ledger.filter((item) => item.payment_id === splitPayment.payment_id)) {
+          if (row.debit_minor) row.debit_minor = splitFirst
+          if (row.credit_minor) row.credit_minor = splitFirst
+        }
+        const secondId = `PAY-${9900 + salt * 100 + invoiceCount + 1}`
+        const splitDate = iso(26, 15, timezone.offset)
+        data.payments.push({ doc_id: `DOC-${secondId}`, payment_id: secondId, timestamp: splitDate, currency: splitInvoice.currency, amount_minor: splitSecond, invoice_refs: [{ invoice_id: splitInvoice.invoice_id, amount_minor: splitSecond }] })
+        const entity = splitInvoice.entity_id
+        makePair(data.ledger, entryIndex, splitDate, 'Accounts payable', 'Cash', splitSecond, splitInvoice.currency, entity, splitInvoice.invoice_id, secondId)
+        entryIndex += 2
+      }
+    }
     const reversalId = `PAY-${9900 + salt * 100 + invoiceCount + 2}`
     const reversalDate = iso(27, 11, timezone.offset)
     data.payments.push({ doc_id: `DOC-${reversalId}`, payment_id: reversalId, timestamp: reversalDate, currency: 'USD', amount_minor: 18500, invoice_refs: [] })
@@ -626,6 +638,18 @@ function evaluateHeuristic(data: GeneratedEpisode, seed: number | string) {
   return findings.slice(0, 30)
 }
 
+function potentialSignals(data: GeneratedEpisode) {
+  const findings = evaluateHeuristic(data, 'signal-scan')
+  const byType = Object.fromEntries(ERROR_TYPES.map((type) => [type, findings.filter((finding) => finding.type === type).length])) as Record<ErrorType, number>
+  const reconciledSplitPayments = data.invoices.filter((invoice) => {
+    const payments = data.payments.filter((payment) => payment.invoice_refs.some((reference) => reference.invoice_id === invoice.invoice_id))
+    const allocated = payments.reduce((sum, payment) => sum + payment.invoice_refs.filter((reference) => reference.invoice_id === invoice.invoice_id).reduce((amount, reference) => amount + reference.amount_minor, 0), 0)
+    return payments.length > 1 && allocated === invoice.total_minor
+  }).length
+  byType.payment_allocation += reconciledSplitPayments
+  return { count: Object.values(byType).reduce((total, count) => total + count, 0), byType }
+}
+
 function createOracleFindings(session: Session): Finding[] {
   return session.data.truth.slice(0, MAX_FINDINGS).map((issue) => ({ type: issue.type, affected_ids: [...issue.affected_ids], claimed_amount_minor: issue.expected_amount_minor, currency: issue.currency, evidence_ids: [...issue.acceptable_evidence[0]], explanation: 'Evidence-backed reference finding for evaluator calibration.' }))
 }
@@ -636,6 +660,7 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
   const aggregate = new Map<string, { tp: number; fp: number; fn: number; reward: number; steps: number }>()
   const policies = ['random', 'reconciliation', 'mark_all', 'oracle'] as const
   const started = Date.now()
+  const benchmarkSessionIds: string[] = []
   for (let index = 0; index < episodeCount; index++) {
     const cleanCount = Math.floor(episodeCount / 4)
     const interactionCount = Math.floor(episodeCount / 4)
@@ -643,6 +668,7 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
     const isInteraction = index >= cleanCount && index < cleanCount + interactionCount
     const interaction = isInteraction ? [index % 2 === 0 ? 'partial_fx' : 'fx_period'] as InteractionScenario[] : []
     const reset = resetEpisode(`${firstSeed}-${index}`, { mode: 'train', includeClean: true, interactions: interaction, errorTypes: clean ? Object.fromEntries(ERROR_TYPES.map((type) => [type, false])) as Record<ErrorType, boolean> : undefined })
+    benchmarkSessionIds.push(reset.session_id)
     const session = sessions.get(reset.session_id)!
     for (const policy of policies) {
       const sessionClone = { ...session, stepCount: 0 }
@@ -661,7 +687,7 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
       aggregate.set(policy, current)
     }
   }
-  sessions.delete([...sessions.entries()].find(([, session]) => session.seed === `${firstSeed}-${episodeCount - 1}`)?.[0] ?? '')
+  for (const sessionId of benchmarkSessionIds) sessions.delete(sessionId)
   const results = policies.map((policy) => {
     const result = aggregate.get(policy)!
     const precision = result.tp + result.fp === 0 ? 0 : result.tp / (result.tp + result.fp)
@@ -675,7 +701,8 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
 export function inspectEpisode(sessionId: string) {
   const session = sessions.get(sessionId)
   if (!session) throw new Error('Episode session not found or expired.')
-  return { episode_id: session.episodeId, manifest: session.data.manifest, ledger: session.data.ledger, invoices: session.data.invoices, payments: session.data.payments, fx: session.data.fx, policy: session.data.policy, step_count: session.stepCount, remaining_steps: Math.max(0, MAX_STEPS - session.stepCount), terminated: session.terminated, truncated: session.truncated }
+  const potential = potentialSignals(session.data)
+  return { episode_id: session.episodeId, manifest: session.data.manifest, ledger: session.data.ledger, invoices: session.data.invoices, payments: session.data.payments, fx: session.data.fx, policy: session.data.policy, potential_count: potential.count, potential_by_type: potential.byType, step_count: session.stepCount, remaining_steps: Math.max(0, MAX_STEPS - session.stepCount), terminated: session.terminated, truncated: session.truncated }
 }
 
 export function baselineFindings(sessionId: string, policy: 'random' | 'reconciliation' | 'mark_all') {

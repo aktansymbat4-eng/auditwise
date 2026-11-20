@@ -245,12 +245,34 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .notice button { display: grid; place-items: center; border: 0; color: #648072; background: transparent; }
 .findings-empty, .chart-empty { display: grid; place-items: center; min-height: 82px; padding: 16px; color: #929d97; text-align: center; font-size: 9px; }
 .chart-empty { min-height: 129px; }
+.finding-explainer { margin: 0 13px 9px; padding: 8px 9px; border: 1px solid #e8efeb; border-radius: 6px; color: #728078; background: #f8faf9; font-size: 8px; line-height: 1.45; }
+.signal-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 6px; margin: 0 13px 8px; }
+.signal-item { min-width: 0; display: flex; flex-direction: column; gap: 4px; padding: 7px 8px; border: 1px solid #edf0ef; border-radius: 6px; background: #fbfcfb; }
+.signal-item strong { overflow: hidden; color: #506158; font-size: 8px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.signal-item span { color: #8c9891; font-size: 8px; }
 .benchmark-table { padding: 0 14px 9px; }
 .benchmark-header, .benchmark-row { display: grid; grid-template-columns: minmax(90px,1.6fr) repeat(4,minmax(42px,.7fr)); gap: 8px; align-items: center; }
 .benchmark-header { padding: 5px 0; border-bottom: 1px solid #edf0ef; color: #99a39e; font-size: 8px; }
 .benchmark-row { min-height: 25px; color: #748079; font-size: 8px; font-variant-numeric: tabular-nums; }
 .benchmark-row strong { color: #42534b; font-weight: 600; }
-.trajectory-view { max-height: 165px; overflow: auto; padding: 0 13px; }
+.reward-history-chart { height: 129px; display: flex; gap: 8px; padding: 5px 14px 0; }
+.reward-axis { display: flex; flex: 0 0 20px; flex-direction: column; justify-content: space-between; padding-bottom: 17px; color: #9ba59f; font-size: 8px; }
+.reward-history-bars { position: relative; display: flex; flex: 1; justify-content: space-around; gap: 8px; padding-bottom: 17px; }
+.reward-zero-line { position: absolute; top: 50%; right: 0; left: 0; border-top: 1px dashed #cdd8d2; }
+.reward-bar-group { position: relative; display: flex; flex: 1; align-items: center; justify-content: center; height: 100%; min-width: 14px; }
+.reward-bar-value { position: absolute; top: 0; z-index: 1; color: #77857d; font-size: 7px; font-variant-numeric: tabular-nums; }
+.reward-bar { position: absolute; width: min(22px,70%); border-radius: 3px 3px 1px 1px; }
+.reward-bar.positive { bottom: 50%; background: linear-gradient(180deg,#56ae8b,#238565); }
+.reward-bar.negative { top: 50%; border-radius: 1px 1px 3px 3px; background: linear-gradient(180deg,#d99a70,#c87855); }
+.reward-bar-group small { position: absolute; bottom: 0; color: #98a39c; font-size: 7px; }
+.trajectory-view { max-height: 260px; overflow: auto; padding: 0 13px; }
+.trajectory-event { padding: 8px 0; border-top: 1px solid #f0f2f1; }
+.trajectory-event-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #53635a; font-size: 8px; }
+.trajectory-event-heading span { color: #73857b; font-variant-numeric: tabular-nums; }
+.trajectory-event code { display: block; overflow-wrap: anywhere; margin-top: 5px; color: #818f87; font: 7px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.trajectory-observation { display: block; overflow-wrap: anywhere; margin-top: 5px; color: #53665b; font-size: 7px; line-height: 1.4; }
+.trajectory-event details { margin-top: 5px; color: #67766e; font-size: 8px; }
+.trajectory-event summary { cursor: pointer; }
 .trajectory-view pre, .evidence-json { max-height: 130px; overflow: auto; margin: 8px 0; padding: 8px; border: 1px solid #edf0ef; border-radius: 5px; color: #59675f; background: #fafbfb; font: 7px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .download-link { display: flex; align-items: center; justify-content: flex-end; gap: 4px; padding: 8px 0; color: #22775d; font-size: 8px; font-weight: 600; text-decoration: none; }
 .dialog-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: rgba(20, 35, 29, .3); }
