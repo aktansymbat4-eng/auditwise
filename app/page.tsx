@@ -7,7 +7,7 @@ export default function Page() {
   const reset = resetEpisode('auditwise-demo-seed-v1', {
     mode: 'train',
     includeClean: true,
-    interactions: ['partial_fx'],
+    interactions: ['partial_fx', 'fx_period'],
     errorTypes: {
       duplicate_invoice: true,
       payment_allocation: true,

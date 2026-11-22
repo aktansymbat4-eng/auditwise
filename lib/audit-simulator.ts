@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { availableParallelism, totalmem } from 'node:os'
 import { ERROR_TYPES, type ErrorType } from './i18n'
 
 export { ERROR_TYPES }
@@ -11,6 +12,7 @@ export interface EpisodeConfig {
   includeClean?: boolean
   interactions?: InteractionScenario[]
   pageSize?: number
+  amountToleranceMinor?: number
 }
 
 export interface LedgerRecord {
@@ -92,6 +94,7 @@ interface Session {
   truncated: boolean
   trajectory: Array<Record<string, unknown>>
   createdAt: number
+  startedAt: number
 }
 
 export type SimulatorAction =
@@ -128,6 +131,7 @@ export interface ResetResult {
 const sessionHost = globalThis as typeof globalThis & { __auditwiseSimulatorSessions?: Map<string, Session> }
 const sessions = sessionHost.__auditwiseSimulatorSessions ?? (sessionHost.__auditwiseSimulatorSessions = new Map<string, Session>())
 const MAX_STEPS = 100
+const MAX_EPISODE_MS = 60_000
 const MAX_FINDINGS = 30
 const MAX_EVIDENCE = 10
 const MAX_EXPLANATION = 1000
@@ -372,17 +376,26 @@ function baseObservation(session: Session, result?: unknown, error?: string): Si
 }
 
 export function resetEpisode(seed: number | string, config: EpisodeConfig = {}): ResetResult {
+  const amountToleranceMinor = config.amountToleranceMinor ?? 0
+  const pageSize = config.pageSize ?? 50
+  if (!Number.isSafeInteger(amountToleranceMinor) || amountToleranceMinor < 0 || amountToleranceMinor > 1_000_000) {
+    throw new Error('Amount tolerance must be an integer between 0 and 1000000 minor units.')
+  }
+  if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 50) throw new Error('Page size must be an integer between 1 and 50.')
+  if (config.interactions?.some((scenario) => !['partial_fx', 'fx_period'].includes(scenario))) throw new Error('Unknown interaction scenario.')
+  if (config.mode && !['train', 'evaluation', 'closed'].includes(config.mode)) throw new Error('Unknown episode mode.')
   const normalizedConfig = {
     ...config,
     mode: config.mode === 'closed' ? 'evaluation' : config.mode ?? 'train',
     includeClean: config.includeClean ?? true,
     pageSize: config.pageSize ?? 50,
+    amountToleranceMinor,
   } satisfies Required<Pick<EpisodeConfig, 'mode' | 'includeClean' | 'pageSize'>> & EpisodeConfig
   const data = generateEpisode(seed, normalizedConfig)
   const sessionId = randomUUID()
   const session: Session = {
     episodeId: String(data.manifest.episode_id), seed, config: normalizedConfig, data,
-    stepCount: 0, terminated: false, truncated: false, trajectory: [], createdAt: Date.now(),
+    stepCount: 0, terminated: false, truncated: false, trajectory: [], createdAt: Date.now(), startedAt: Date.now(),
   }
   sessions.set(sessionId, session)
   for (const [id, existing] of sessions) if (Date.now() - existing.createdAt > MAX_SESSION_AGE_MS) sessions.delete(id)
@@ -442,17 +455,24 @@ function safeCalculate(expression: string): number {
 
 function normalizeIds(ids: string[]): string[] { return [...new Set(ids)].sort() }
 function evidenceMatches(given: string[], accepted: string[][], availableIds?: Set<string>): boolean {
+  if (!given.length || given.length > MAX_EVIDENCE || new Set(given).size !== given.length) return false
   const evidence = new Set(given)
   if (availableIds && given.some((id) => !availableIds.has(id))) return false
   return accepted.some((set) => set.every((id) => evidence.has(id)))
 }
 
-export function scoreFindings(truth: TruthIssue[], findings: Finding[], inspectionSteps: number, availableIds?: Set<string>) {
+export function scoreFindings(
+  truth: TruthIssue[],
+  findings: Finding[],
+  inspectionSteps: number,
+  availableIds?: Set<string>,
+  amountToleranceMinor = 0,
+) {
   const truthOrder = truth.map((issue, index) => ({ issue, index })).sort((left, right) => left.issue.issue_id < right.issue.issue_id ? -1 : left.issue.issue_id > right.issue.issue_id ? 1 : 0)
   const edges = truthOrder.map(({ issue }) => findings.flatMap((finding, index) => {
     const matches = issue.type === finding.type
       && issue.currency === finding.currency
-      && Math.abs(issue.expected_amount_minor - finding.claimed_amount_minor) === 0
+      && Math.abs(issue.expected_amount_minor - finding.claimed_amount_minor) <= amountToleranceMinor
       && JSON.stringify(normalizeIds(issue.affected_ids)) === JSON.stringify(normalizeIds(finding.affected_ids))
       && evidenceMatches(finding.evidence_ids, issue.acceptable_evidence, availableIds)
     return matches ? [index] : []
@@ -490,7 +510,7 @@ function validateSubmission(value: unknown): { episode_id: string; findings: Fin
   const findings = input.findings.map((item) => {
     if (!item || typeof item !== 'object') throw new Error('Invalid findings payload.')
     const finding = item as Partial<Finding>
-    if (typeof finding.type !== 'string' || !Array.isArray(finding.affected_ids) || finding.affected_ids.length === 0 || finding.affected_ids.some((id) => typeof id !== 'string') || !Number.isSafeInteger(finding.claimed_amount_minor) || typeof finding.currency !== 'string' || !Array.isArray(finding.evidence_ids) || finding.evidence_ids.length > MAX_EVIDENCE || finding.evidence_ids.some((id) => typeof id !== 'string') || typeof finding.explanation !== 'string' || finding.explanation.length > MAX_EXPLANATION) throw new Error('Invalid findings payload.')
+    if (typeof finding.type !== 'string' || !Array.isArray(finding.affected_ids) || finding.affected_ids.length === 0 || finding.affected_ids.some((id) => typeof id !== 'string' || id.length > 128) || !Number.isSafeInteger(finding.claimed_amount_minor) || finding.claimed_amount_minor! < 0 || typeof finding.currency !== 'string' || !/^[A-Z]{3}$/.test(finding.currency) || !Array.isArray(finding.evidence_ids) || finding.evidence_ids.length > MAX_EVIDENCE || finding.evidence_ids.some((id) => typeof id !== 'string' || id.length > 128) || typeof finding.explanation !== 'string' || finding.explanation.length > MAX_EXPLANATION) throw new Error('Invalid findings payload.')
     return finding as Finding
   })
   return { episode_id: input.episode_id, findings }
@@ -540,7 +560,7 @@ function takeAction(session: Session, action: SimulatorAction): unknown {
       const payload = validateSubmission(action.findings)
       if (payload.episode_id !== session.episodeId) throw new Error('Episode ID does not match the active episode.')
       const available = knownIds(session)
-      return { submitted: true, findings_count: payload.findings.length, score: scoreFindings(session.data.truth, payload.findings, Math.max(0, session.stepCount - 1), available) }
+      return { submitted: true, findings_count: payload.findings.length, score: scoreFindings(session.data.truth, payload.findings, Math.max(0, session.stepCount - 1), available, session.config.amountToleranceMinor ?? 0) }
     }
     default: throw new Error('Unknown action.')
   }
@@ -550,6 +570,12 @@ export function stepEpisode(sessionId: string, action: SimulatorAction): StepRes
   const session = sessions.get(sessionId)
   if (!session) throw new Error('Episode session not found or expired. Reset to start a new episode.')
   if (session.terminated || session.truncated) throw new Error('Episode has already ended.')
+  if (Date.now() - session.startedAt >= MAX_EPISODE_MS) {
+    session.truncated = true
+    const step = { action, observation: {}, reward: 0, terminated: false, truncated: true }
+    session.trajectory.push({ episode_id: session.episodeId, step: session.stepCount, ...step })
+    return { observation: {} as SimulatorObservation, reward: 0, terminated: false, truncated: true, info: {} }
+  }
   session.stepCount++
   let result: unknown
   let error: string | undefined
@@ -601,7 +627,7 @@ function evaluateHeuristic(data: GeneratedEpisode, seed: number | string) {
     findings.push({ type, affected_ids: ids, claimed_amount_minor: amount, currency, evidence_ids: evidence, explanation })
   }
   const invoiceGroups = new Map<string, LedgerRecord[]>()
-  for (const row of data.ledger.filter((item) => item.payment_id === null && item.invoice_id)) {
+  for (const row of [...data.ledger].sort((left, right) => left.row_id.localeCompare(right.row_id)).filter((item) => item.payment_id === null && item.invoice_id)) {
     invoiceGroups.set(row.invoice_id!, [...(invoiceGroups.get(row.invoice_id!) ?? []), row])
   }
   for (const [invoiceId, rows] of invoiceGroups) {
@@ -667,12 +693,24 @@ function createOracleFindings(session: Session): Finding[] {
 }
 
 export function runBaselines(options: { seed?: number | string; episodes?: number } = {}) {
-  const episodeCount = Math.max(4, Math.min(40, Math.floor(options.episodes ?? 20)))
+  const episodeCount = 20
   const firstSeed = options.seed ?? 'auditwise-benchmark-v1'
   const aggregate = new Map<string, { tp: number; fp: number; fn: number; reward: number; steps: number }>()
+  const coverage = Object.fromEntries(ERROR_TYPES.map((type) => [type, { episodes: 0, findings: 0 }])) as Record<ErrorType, { episodes: number; findings: number }>
   const policies = ['random', 'reconciliation', 'mark_all', 'oracle'] as const
   const started = Date.now()
   const benchmarkSessionIds: string[] = []
+  let pairedChecksPassed = 0
+  const pairedCheckCount = 20
+  const adversarialChecks: Record<string, boolean> = {
+    oracle_beats_silence: false,
+    silence_beats_false_accusations_on_clean: false,
+    duplicate_findings_do_not_gain: false,
+    guessed_ids_rejected: false,
+    unsupported_evidence_rejected: false,
+    wrong_currency_rejected: false,
+    amount_tolerance_is_explicit: false,
+  }
   for (let index = 0; index < episodeCount; index++) {
     const cleanCount = Math.floor(episodeCount / 4)
     const interactionCount = Math.floor(episodeCount / 4)
@@ -682,6 +720,11 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
     const reset = resetEpisode(`${firstSeed}-${index}`, { mode: 'train', includeClean: true, interactions: interaction, errorTypes: clean ? Object.fromEntries(ERROR_TYPES.map((type) => [type, false])) as Record<ErrorType, boolean> : undefined })
     benchmarkSessionIds.push(reset.session_id)
     const session = sessions.get(reset.session_id)!
+    for (const type of ERROR_TYPES) {
+      const count = session.data.truth.filter((issue) => issue.type === type).length
+      if (count > 0) coverage[type].episodes++
+      coverage[type].findings += count
+    }
     for (const policy of policies) {
       const sessionClone = { ...session, stepCount: 0 }
       let findings: Finding[]
@@ -698,6 +741,50 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
       current.tp += score.tp; current.fp += score.fp; current.fn += score.fn; current.reward += score.reward; current.steps += steps
       aggregate.set(policy, current)
     }
+    if (index < pairedCheckCount) {
+      const oracleFindings = createOracleFindings(session)
+      const original = scoreFindings(session.data.truth, oracleFindings, 12, knownIds(session))
+      const allIds = [...knownIds(session)].sort()
+      const remap = new Map(allIds.map((id, idIndex) => [id, `PAIR-${index}-${idIndex}`]))
+      const remappedTruth = [...session.data.truth].reverse().map((issue) => ({
+        ...issue,
+        affected_ids: issue.affected_ids.map((id) => remap.get(id)!),
+        acceptable_evidence: issue.acceptable_evidence.map((set) => set.map((id) => remap.get(id)!)),
+      }))
+      const remappedFindings = [...oracleFindings].reverse().map((finding) => ({
+        ...finding,
+        affected_ids: finding.affected_ids.map((id) => remap.get(id)!),
+        evidence_ids: finding.evidence_ids.map((id) => remap.get(id)!),
+      }))
+      const remappedAvailable = new Set(allIds.map((id) => remap.get(id)!))
+      const paired = scoreFindings(remappedTruth, remappedFindings, 12, remappedAvailable)
+      const originalHeuristic = scoreFindings(session.data.truth, evaluateHeuristic(session.data, firstSeed), 12, knownIds(session))
+      const reorderedData: GeneratedEpisode = { ...session.data, ledger: [...session.data.ledger].reverse(), invoices: [...session.data.invoices].reverse(), payments: [...session.data.payments].reverse(), fx: [...session.data.fx].reverse() }
+      const reorderedHeuristic = scoreFindings(session.data.truth, evaluateHeuristic(reorderedData, firstSeed), 12, knownIds(session))
+      if (original.tp === paired.tp && original.fp === paired.fp && original.fn === paired.fn && original.f1 === paired.f1 && originalHeuristic.tp === reorderedHeuristic.tp && originalHeuristic.fp === reorderedHeuristic.fp && originalHeuristic.fn === reorderedHeuristic.fn && originalHeuristic.f1 === reorderedHeuristic.f1) pairedChecksPassed++
+    }
+    if (index === 0) {
+      const empty = scoreFindings(session.data.truth, [], 0, knownIds(session))
+      const falseAccusations = scoreFindings(session.data.truth, baselineFindings(reset.session_id, 'mark_all'), 0, knownIds(session))
+      adversarialChecks.silence_beats_false_accusations_on_clean = empty.f1 > falseAccusations.f1
+    }
+    if (index === 5) {
+      const oracle = createOracleFindings(session)
+      const available = knownIds(session)
+      const correct = scoreFindings(session.data.truth, oracle, 12, available)
+      const silent = scoreFindings(session.data.truth, [], 0, available)
+      const duplicate = scoreFindings(session.data.truth, [...oracle, ...oracle.slice(0, 1)], 12, available)
+      const guessedIds = oracle.map((finding) => ({ ...finding, affected_ids: finding.affected_ids.map((id) => `GUESSED-${id}`) }))
+      const unsupportedEvidence = oracle.map((finding) => ({ ...finding, evidence_ids: ['NOT-AVAILABLE'] }))
+      const wrongCurrency = oracle.map((finding) => ({ ...finding, currency: 'ZZZ' }))
+      const oneMinorOff = oracle.map((finding, findingIndex) => findingIndex === 0 ? { ...finding, claimed_amount_minor: finding.claimed_amount_minor + 1 } : finding)
+      adversarialChecks.amount_tolerance_is_explicit = scoreFindings(session.data.truth, oneMinorOff, 12, available).f1 < correct.f1 && scoreFindings(session.data.truth, oneMinorOff, 12, available, 1).f1 === correct.f1
+      adversarialChecks.oracle_beats_silence = correct.f1 > silent.f1
+      adversarialChecks.duplicate_findings_do_not_gain = duplicate.f1 < correct.f1
+      adversarialChecks.guessed_ids_rejected = scoreFindings(session.data.truth, guessedIds, 12, available).f1 < correct.f1
+      adversarialChecks.unsupported_evidence_rejected = scoreFindings(session.data.truth, unsupportedEvidence, 12, available).f1 < correct.f1
+      adversarialChecks.wrong_currency_rejected = scoreFindings(session.data.truth, wrongCurrency, 12, available).f1 < correct.f1
+    }
   }
   for (const sessionId of benchmarkSessionIds) sessions.delete(sessionId)
   const results = policies.map((policy) => {
@@ -707,14 +794,14 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
     const f1 = result.tp === 0 && result.fp === 0 && result.fn === 0 ? 1 : (2 * result.tp) / (2 * result.tp + result.fp + result.fn)
     return { policy, episodes: episodeCount, precision, recall, f1, mean_reward: result.reward / episodeCount, mean_steps: result.steps / episodeCount }
   })
-  return { benchmark_id: `BENCH-${seedNumber(firstSeed).toString(16)}`, episodes: episodeCount, clean_episodes: Math.floor(episodeCount / 4), interacting_episodes: Math.floor(episodeCount / 4), elapsed_ms: Date.now() - started, policies: results }
+  return { benchmark_id: `BENCH-${seedNumber(firstSeed).toString(16)}`, seed: firstSeed, protocol_version: '1.0', dataset_version: '1.0', policy_version: '1.0', runtime: { node: process.version, platform: process.platform, arch: process.arch, cpu_threads: availableParallelism(), total_memory_bytes: totalmem() }, episodes: episodeCount, clean_episodes: Math.floor(episodeCount / 4), interacting_episodes: Math.floor(episodeCount / 4), paired_checks: pairedCheckCount, paired_checks_passed: pairedChecksPassed, coverage_by_type: coverage, adversarial_checks: adversarialChecks, elapsed_ms: Date.now() - started, policies: results }
 }
 
 export function inspectEpisode(sessionId: string) {
   const session = sessions.get(sessionId)
   if (!session) throw new Error('Episode session not found or expired.')
-  const potential = potentialSignals(session.data)
-  return { episode_id: session.episodeId, manifest: session.data.manifest, ledger: session.data.ledger, invoices: session.data.invoices, payments: session.data.payments, fx: session.data.fx, policy: session.data.policy, potential_count: potential.count, potential_by_type: potential.byType, step_count: session.stepCount, remaining_steps: Math.max(0, MAX_STEPS - session.stepCount), terminated: session.terminated, truncated: session.truncated }
+  const potential = session.config.mode === 'train' ? potentialSignals(session.data) : undefined
+  return { episode_id: session.episodeId, manifest: session.data.manifest, ledger: session.data.ledger, invoices: session.data.invoices, payments: session.data.payments, fx: session.data.fx, policy: session.data.policy, ...(potential ? { potential_count: potential.count, potential_by_type: potential.byType } : {}), step_count: session.stepCount, remaining_steps: Math.max(0, MAX_STEPS - session.stepCount), terminated: session.terminated, truncated: session.truncated }
 }
 
 export function baselineFindings(sessionId: string, policy: 'random' | 'reconciliation' | 'mark_all') {
