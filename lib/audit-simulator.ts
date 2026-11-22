@@ -5,6 +5,7 @@ import { ERROR_TYPES, type ErrorType } from './i18n'
 export { ERROR_TYPES }
 export type TableName = 'ledger' | 'invoices' | 'payments' | 'fx' | 'policy'
 export type InteractionScenario = 'partial_fx' | 'fx_period'
+export type CleanScenario = 'ordinary' | 'split_payment' | 'reversal' | 'repeated_amounts' | 'policy_boundary'
 
 export interface EpisodeConfig {
   mode?: 'train' | 'evaluation' | 'closed'
@@ -13,6 +14,8 @@ export interface EpisodeConfig {
   interactions?: InteractionScenario[]
   pageSize?: number
   amountToleranceMinor?: number
+  cleanScenario?: CleanScenario
+  paymentAllocationMode?: 'missing' | 'partial'
 }
 
 export interface LedgerRecord {
@@ -83,6 +86,8 @@ interface GeneratedEpisode {
   truth: TruthIssue[]
   provenance: Array<Record<string, unknown>>
 }
+
+export type PolicyDataset = Pick<GeneratedEpisode, 'manifest' | 'policy' | 'ledger' | 'invoices' | 'payments' | 'fx'>
 
 interface Session {
   episodeId: string
@@ -167,6 +172,21 @@ function iso(day: number, hour = 12, offset = '+00:00'): string {
   return `2026-11-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:00:00${offset}`
 }
 
+function convertMinorUnits(amountMinor: number, rate: string): number {
+  const match = /^(\d+)(?:\.(\d+))?$/.exec(rate)
+  if (!match) throw new Error('FX rate must be a decimal string.')
+  const fraction = match[2] ?? ''
+  const denominator = 10 ** fraction.length
+  const numerator = Number(`${match[1]}${fraction}`)
+  const product = amountMinor * numerator
+  if (!Number.isSafeInteger(numerator) || !Number.isSafeInteger(product)) throw new Error('Converted amount exceeds the safe integer range.')
+  const rounded = product < 0
+    ? -Math.floor((-product + denominator / 2) / denominator)
+    : Math.floor((product + denominator / 2) / denominator)
+  if (!Number.isSafeInteger(rounded)) throw new Error('Converted amount exceeds the safe integer range.')
+  return rounded
+}
+
 function nextId(prefix: string, index: number): string {
   return `${prefix}-${String(index).padStart(5, '0')}`
 }
@@ -209,7 +229,7 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
       schema_version: '1.0', episode_id: '', company_name: COMPANIES[seedNumber(seed) % COMPANIES.length], base_currency: 'USD', period_start: '2026-11-01', period_end: '2026-11-30',
       timezone: timezone.name, rounding: 'half_up', minor_unit_exponent: { USD: 2, EUR: 2, KZT: 2 },
     },
-    policy: { fx_rate_date: 'payment_date', period_boundary: 'inclusive', rounding: 'half_up', base_currency: 'USD' },
+    policy: { fx_rate_date: 'payment_date', period_boundary: 'inclusive', rounding: 'half_up', base_currency: 'USD', amount_tolerance_minor: config.amountToleranceMinor ?? 0 },
     ledger: [], invoices: [], payments: [], fx: [], truth: [], provenance: [],
   }
   const fxRate = (date: string, currency: string) => currency === 'EUR' ? (date < '2026-11-15' ? '1.0800' : '1.1000') : currency === 'KZT' ? '0.0021' : '1.0000'
@@ -228,7 +248,10 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
   const allocationIndex = (salt + 1) % invoiceCount
   const interactionFxIndex = (salt + 2) % invoiceCount
   const periodIndex = (salt + 3) % invoiceCount
-  const cleanPairIndices = config.includeClean === false ? [] : Array.from({ length: invoiceCount }, (_, index) => index)
+  const cleanScenario = config.cleanScenario
+  const usesCleanPair = cleanScenario === undefined || cleanScenario === 'split_payment' || cleanScenario === 'repeated_amounts'
+  const repeatsCleanAmounts = cleanScenario === undefined || cleanScenario === 'repeated_amounts'
+  const cleanPairIndices = config.includeClean === false || !usesCleanPair ? [] : Array.from({ length: invoiceCount }, (_, index) => index)
     .filter((index) => ![duplicateIndex, allocationIndex, interactionFxIndex, periodIndex].includes(index))
     .slice(0, 2)
   const cleanPairAmount = Math.round((150 + rand() * 920) * 100)
@@ -237,13 +260,15 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
     const invoiceNumber = 8800 + salt * 100 + index
     const invoiceId = `INV-${invoiceNumber}`
     const entityId = `ENT-${String(salt * 100 + index + 1).padStart(6, '0')}`
-    const currency = cleanPairIndices.includes(index) ? 'USD' : CURRENCIES[(index + salt) % CURRENCIES.length]
-    const amount = cleanPairIndices.includes(index)
+    const isRepeatedCleanAmount = repeatsCleanAmounts && cleanPairIndices.includes(index)
+    const isPolicyBoundary = cleanScenario === 'policy_boundary' && index === 0
+    const currency = isPolicyBoundary ? 'EUR' : cleanPairIndices.includes(index) ? 'USD' : CURRENCIES[(index + salt) % CURRENCIES.length]
+    const amount = isRepeatedCleanAmount
       ? (cleanPairIndices.indexOf(index) === 0 ? cleanPairAmount : data.invoices[cleanPairIndices[0]].total_minor)
       : Math.round((150 + rand() * 920) * 100)
-    const issuedDay = 2 + Math.floor(rand() * 24)
+    const issuedDay = isPolicyBoundary ? 28 : 2 + Math.floor(rand() * 24)
     const invoiceDate = iso(issuedDay, 12, timezone.offset)
-    const paymentDate = iso(Math.min(29, issuedDay + 2), 15, timezone.offset)
+    const paymentDate = isPolicyBoundary ? iso(30, 15, timezone.offset) : iso(Math.min(29, issuedDay + 2), 15, timezone.offset)
     const isMisallocationIssue = enabled.payment_allocation && index === allocationIndex
     const isPartialPaymentIssue = enabled.payment_allocation && interactions.includes('partial_fx') && index === interactionFxIndex
     const isAllocationIssue = isMisallocationIssue || isPartialPaymentIssue
@@ -255,7 +280,8 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
     const paymentId = `PAY-${9900 + salt * 100 + index}`
     const paymentAmount = isPartialPaymentIssue ? Math.round(amount * 0.62) : amount
     const misallocatedAmount = isMisallocationIssue ? Math.round(paymentAmount * 0.38) : 0
-    const correctlyAllocatedAmount = paymentAmount - misallocatedAmount
+    const isMissingAllocation = isMisallocationIssue && config.paymentAllocationMode === 'missing'
+    const correctlyAllocatedAmount = isMissingAllocation ? 0 : paymentAmount - misallocatedAmount
     const issueIndices = new Set([duplicateIndex, allocationIndex, interactionFxIndex, periodIndex])
     const misallocatedInvoiceIndex = cleanPairIndices[1] ?? Array.from({ length: invoiceCount }, (_, candidate) => candidate).find((candidate) => candidate !== index && !issueIndices.has(candidate)) ?? (index + 1) % invoiceCount
     const misallocatedInvoiceId = `INV-${8800 + salt * 100 + misallocatedInvoiceIndex}`
@@ -265,7 +291,7 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
     }
     const paymentDoc: PaymentDocument = {
       doc_id: `DOC-${paymentId}`, payment_id: paymentId, timestamp: paymentDate, currency: paymentCurrency, amount_minor: paymentAmount,
-      invoice_refs: [
+      invoice_refs: isMissingAllocation ? [] : [
         { invoice_id: invoiceId, amount_minor: correctlyAllocatedAmount },
         ...(misallocatedAmount ? [{ invoice_id: misallocatedInvoiceId, amount_minor: misallocatedAmount }] : []),
       ],
@@ -281,7 +307,9 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
     if (isAllocationIssue) {
       issues.push({ issue_id: `ISS-${invoiceId}-allocation`, type: 'payment_allocation', affected_ids: paymentRows, expected_amount_minor: amount - correctlyAllocatedAmount, currency: transactionCurrency, acceptable_evidence: [[...paymentRows, invoiceDoc.doc_id, paymentDoc.doc_id].sort()] })
       data.provenance.push(isMisallocationIssue
-        ? { change: 'payment_partially_allocated_to_wrong_invoice', invoice_id: invoiceId, misallocated_invoice_id: misallocatedInvoiceId, misallocated_amount_minor: misallocatedAmount }
+        ? isMissingAllocation
+          ? { change: 'payment_allocation_missing', invoice_id: invoiceId, unallocated_amount_minor: amount }
+          : { change: 'payment_partially_allocated_to_wrong_invoice', invoice_id: invoiceId, misallocated_invoice_id: misallocatedInvoiceId, misallocated_amount_minor: misallocatedAmount }
         : { change: 'payment_amount_reduced', invoice_id: invoiceId, from_minor: amount, to_minor: paymentAmount })
     }
 
@@ -303,8 +331,8 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
     if (isFxIssue && transactionCurrency !== 'USD') {
       const baseRate = fxRate(paymentDate.slice(0, 10), transactionCurrency)
       const selectedRate = baseRate === '1.1000' ? '1.0800' : '1.1000'
-      const correctBase = Math.round(paymentAmount * Number(baseRate))
-      const recordedBase = Math.round(paymentAmount * Number(selectedRate))
+      const correctBase = convertMinorUnits(paymentAmount, baseRate)
+      const recordedBase = convertMinorUnits(paymentAmount, selectedRate)
       const fxId = transactionCurrency === 'EUR'
         ? `FX-${salt}-EUR-${baseRate === '1.1000' ? '20261115' : '20261101'}`
         : `FX-${salt}-KZT-20261101`
@@ -315,7 +343,7 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
       data.provenance.push({ change: 'fx_rate_selection_changed', invoice_id: invoiceId, expected_rate: baseRate, applied_rate: selectedRate })
     } else if (transactionCurrency !== 'USD') {
       const rate = fxRate(paymentDate.slice(0, 10), transactionCurrency)
-      makePair(data.ledger, entryIndex, paymentDate, 'Foreign exchange clearing', 'Cash', Math.round(paymentAmount * Number(rate)), 'USD', entityId, invoiceId, paymentId)
+      makePair(data.ledger, entryIndex, paymentDate, 'Foreign exchange clearing', 'Cash', convertMinorUnits(paymentAmount, rate), 'USD', entityId, invoiceId, paymentId)
       entryIndex += 2
     }
 
@@ -329,30 +357,34 @@ function generateEpisode(seed: number | string, config: EpisodeConfig): Generate
 
   // A plausible split payment and repeated invoice amounts act as clean distractors.
   if (config.includeClean !== false) {
-    const splitInvoice = data.invoices[cleanPairIndices[0]]
-    if (splitInvoice) {
-      const splitPayment = data.payments.find((payment) => payment.invoice_refs.some((ref) => ref.invoice_id === splitInvoice.invoice_id))
-      if (splitPayment) {
-        const splitFirst = Math.floor(splitPayment.amount_minor * 0.4)
-        const splitSecond = splitPayment.amount_minor - splitFirst
-        splitPayment.amount_minor = splitFirst
-        splitPayment.invoice_refs = [{ invoice_id: splitInvoice.invoice_id, amount_minor: splitFirst }]
-        for (const row of data.ledger.filter((item) => item.payment_id === splitPayment.payment_id)) {
-          if (row.debit_minor) row.debit_minor = splitFirst
-          if (row.credit_minor) row.credit_minor = splitFirst
+    if (cleanScenario === undefined || cleanScenario === 'split_payment') {
+      const splitInvoice = data.invoices[cleanPairIndices[0]]
+      if (splitInvoice) {
+        const splitPayment = data.payments.find((payment) => payment.invoice_refs.some((ref) => ref.invoice_id === splitInvoice.invoice_id))
+        if (splitPayment) {
+          const splitFirst = Math.floor(splitPayment.amount_minor * 0.4)
+          const splitSecond = splitPayment.amount_minor - splitFirst
+          splitPayment.amount_minor = splitFirst
+          splitPayment.invoice_refs = [{ invoice_id: splitInvoice.invoice_id, amount_minor: splitFirst }]
+          for (const row of data.ledger.filter((item) => item.payment_id === splitPayment.payment_id)) {
+            if (row.debit_minor) row.debit_minor = splitFirst
+            if (row.credit_minor) row.credit_minor = splitFirst
+          }
+          const secondId = `PAY-${9900 + salt * 100 + invoiceCount + 1}`
+          const splitDate = iso(26, 15, timezone.offset)
+          data.payments.push({ doc_id: `DOC-${secondId}`, payment_id: secondId, timestamp: splitDate, currency: splitInvoice.currency, amount_minor: splitSecond, invoice_refs: [{ invoice_id: splitInvoice.invoice_id, amount_minor: splitSecond }] })
+          const entity = splitInvoice.entity_id
+          makePair(data.ledger, entryIndex, splitDate, 'Accounts payable', 'Cash', splitSecond, splitInvoice.currency, entity, splitInvoice.invoice_id, secondId)
+          entryIndex += 2
         }
-        const secondId = `PAY-${9900 + salt * 100 + invoiceCount + 1}`
-        const splitDate = iso(26, 15, timezone.offset)
-        data.payments.push({ doc_id: `DOC-${secondId}`, payment_id: secondId, timestamp: splitDate, currency: splitInvoice.currency, amount_minor: splitSecond, invoice_refs: [{ invoice_id: splitInvoice.invoice_id, amount_minor: splitSecond }] })
-        const entity = splitInvoice.entity_id
-        makePair(data.ledger, entryIndex, splitDate, 'Accounts payable', 'Cash', splitSecond, splitInvoice.currency, entity, splitInvoice.invoice_id, secondId)
-        entryIndex += 2
       }
     }
-    const reversalId = `PAY-${9900 + salt * 100 + invoiceCount + 2}`
-    const reversalDate = iso(27, 11, timezone.offset)
-    data.payments.push({ doc_id: `DOC-${reversalId}`, payment_id: reversalId, timestamp: reversalDate, currency: 'USD', amount_minor: 18500, invoice_refs: [] })
-    makePair(data.ledger, entryIndex, reversalDate, 'Cash', 'Accounts receivable', 18500, 'USD', data.invoices[5]?.entity_id ?? 'ENT-000', null, reversalId)
+    if (cleanScenario === undefined || cleanScenario === 'reversal') {
+      const reversalId = `PAY-${9900 + salt * 100 + invoiceCount + 2}`
+      const reversalDate = iso(27, 11, timezone.offset)
+      data.payments.push({ doc_id: `DOC-${reversalId}`, payment_id: reversalId, timestamp: reversalDate, currency: 'USD', amount_minor: 18500, invoice_refs: [] })
+      makePair(data.ledger, entryIndex, reversalDate, 'Cash', 'Accounts receivable', 18500, 'USD', data.invoices[5]?.entity_id ?? 'ENT-000', null, reversalId)
+    }
   }
 
   data.ledger.sort((left, right) => left.timestamp.localeCompare(right.timestamp) || left.row_id.localeCompare(right.row_id))
@@ -383,6 +415,8 @@ export function resetEpisode(seed: number | string, config: EpisodeConfig = {}):
   }
   if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 50) throw new Error('Page size must be an integer between 1 and 50.')
   if (config.interactions?.some((scenario) => !['partial_fx', 'fx_period'].includes(scenario))) throw new Error('Unknown interaction scenario.')
+  if (config.cleanScenario && !['ordinary', 'split_payment', 'reversal', 'repeated_amounts', 'policy_boundary'].includes(config.cleanScenario)) throw new Error('Unknown clean scenario.')
+  if (config.paymentAllocationMode && !['missing', 'partial'].includes(config.paymentAllocationMode)) throw new Error('Unknown payment allocation mode.')
   if (config.mode && !['train', 'evaluation', 'closed'].includes(config.mode)) throw new Error('Unknown episode mode.')
   const normalizedConfig = {
     ...config,
@@ -455,7 +489,7 @@ function safeCalculate(expression: string): number {
 
 function normalizeIds(ids: string[]): string[] { return [...new Set(ids)].sort() }
 function evidenceMatches(given: string[], accepted: string[][], availableIds?: Set<string>): boolean {
-  if (!given.length || given.length > MAX_EVIDENCE || new Set(given).size !== given.length) return false
+  if (!given.length || given.length > MAX_EVIDENCE) return false
   const evidence = new Set(given)
   if (availableIds && given.some((id) => !availableIds.has(id))) return false
   return accepted.some((set) => set.every((id) => evidence.has(id)))
@@ -510,10 +544,79 @@ function validateSubmission(value: unknown): { episode_id: string; findings: Fin
   const findings = input.findings.map((item) => {
     if (!item || typeof item !== 'object') throw new Error('Invalid findings payload.')
     const finding = item as Partial<Finding>
-    if (typeof finding.type !== 'string' || !Array.isArray(finding.affected_ids) || finding.affected_ids.length === 0 || finding.affected_ids.some((id) => typeof id !== 'string' || id.length > 128) || !Number.isSafeInteger(finding.claimed_amount_minor) || finding.claimed_amount_minor! < 0 || typeof finding.currency !== 'string' || !/^[A-Z]{3}$/.test(finding.currency) || !Array.isArray(finding.evidence_ids) || finding.evidence_ids.length > MAX_EVIDENCE || finding.evidence_ids.some((id) => typeof id !== 'string' || id.length > 128) || typeof finding.explanation !== 'string' || finding.explanation.length > MAX_EXPLANATION) throw new Error('Invalid findings payload.')
+    if (typeof finding.type !== 'string' || !Array.isArray(finding.affected_ids) || finding.affected_ids.length === 0 || finding.affected_ids.some((id) => typeof id !== 'string') || !Number.isSafeInteger(finding.claimed_amount_minor) || typeof finding.currency !== 'string' || !Array.isArray(finding.evidence_ids) || finding.evidence_ids.length > MAX_EVIDENCE || finding.evidence_ids.some((id) => typeof id !== 'string') || typeof finding.explanation !== 'string' || Array.from(finding.explanation).length > MAX_EXPLANATION) throw new Error('Invalid findings payload.')
     return finding as Finding
   })
   return { episode_id: input.episode_id, findings }
+}
+
+function runMatcherContractChecks() {
+  const available = new Set(['R1', 'R2', 'R3', 'R4', 'R5', 'D1', 'D2', 'D3', 'D4'])
+  const issue = (issueId = 'ISS-A', affectedIds = ['R1', 'R2'], evidence = [['D1', 'D2']]): TruthIssue => ({ issue_id: issueId, type: 'duplicate_invoice', affected_ids: affectedIds, expected_amount_minor: 10000, currency: 'KZT', acceptable_evidence: evidence })
+  const correct: Finding = { type: 'duplicate_invoice', affected_ids: ['R1', 'R2'], claimed_amount_minor: 10000, currency: 'KZT', evidence_ids: ['D1', 'D2'], explanation: 'Supported duplicate invoice.' }
+  const baseTruth = [issue()]
+  const invalidPayload = (findings: unknown[]) => {
+    try { validateSubmission({ episode_id: 'AUD-TEST', findings }); return false }
+    catch { return true }
+  }
+  const equalScore = (actual: ReturnType<typeof scoreFindings>, expected: { tp: number; fp: number; fn: number; precision: number; recall: number; f1: number; reward: number }) =>
+    actual.tp === expected.tp && actual.fp === expected.fp && actual.fn === expected.fn
+      && Math.abs(actual.precision - expected.precision) <= 1e-9 && Math.abs(actual.recall - expected.recall) <= 1e-9
+      && Math.abs(actual.f1 - expected.f1) <= 1e-9 && Math.abs(actual.reward - expected.reward) <= 1e-9
+  const finding = (overrides: Partial<Finding> = {}): Finding => ({ ...correct, ...overrides })
+  const outcome = (truth: TruthIssue[], findings: Finding[], steps: number, expected: Parameters<typeof equalScore>[1], tolerance = 0) =>
+    equalScore(scoreFindings(truth, findings, steps, available, tolerance), expected)
+  const noMatch = { tp: 0, fp: 1, fn: 1, precision: 0, recall: 0, f1: 0, reward: -1 }
+  const onePerfect = { tp: 1, fp: 0, fn: 0, precision: 1, recall: 1, f1: 1, reward: 0.98 }
+  const checks: Record<string, boolean> = {
+    C01_exact_match: outcome(baseTruth, [correct], 10, onePerfect),
+    C02_silence_misses_truth: equalScore(scoreFindings(baseTruth, [], 10, available), { tp: 0, fp: 0, fn: 1, precision: 0, recall: 0, f1: 0, reward: -1 }),
+    C03_empty_truth_silence: equalScore(scoreFindings([], [], 10, available), { tp: 0, fp: 0, fn: 0, precision: 0, recall: 0, f1: 1, reward: 0.98 }),
+    C04_false_finding: equalScore(scoreFindings([], [correct], 10, available), { tp: 0, fp: 1, fn: 0, precision: 0, recall: 0, f1: 0, reward: -1 }),
+    C05_duplicate_finding_is_fp: outcome(baseTruth, [correct, correct], 10, { tp: 1, fp: 1, fn: 0, precision: 0.5, recall: 1, f1: 2 / 3, reward: 47 / 150 }),
+    C06_wrong_type_is_nonmatch: outcome(baseTruth, [finding({ type: 'unknown_type' })], 10, noMatch),
+    C07_wrong_ids_are_nonmatch: outcome(baseTruth, [finding({ affected_ids: ['R1', 'R3'] })], 10, noMatch),
+    C08_amount_is_exact_by_default: outcome(baseTruth, [finding({ claimed_amount_minor: 10001 })], 10, noMatch),
+    C09_currency_is_exact: outcome(baseTruth, [finding({ currency: 'kzt' })], 10, noMatch),
+    C10_partial_evidence_is_not_enough: outcome(baseTruth, [finding({ evidence_ids: ['D1'] })], 10, noMatch),
+    C11_unknown_evidence_blocks_match: outcome(baseTruth, [finding({ evidence_ids: ['D1', 'D2', 'U'] })], 10, noMatch),
+    C12_mass_marking_is_penalized: (() => {
+      const bulk = ['R1', 'R2', 'R3', 'R4', 'R5'].flatMap((id) => ERROR_TYPES.map((type) => id === 'R1' && type === 'duplicate_invoice' ? correct : finding({ type, affected_ids: [id], evidence_ids: [id] })))
+      return outcome(baseTruth, bulk, 10, { tp: 1, fp: 19, fn: 0, precision: 1 / 20, recall: 1, f1: 2 / 21, reward: -871 / 1050 })
+    })(),
+    C13_partial_recall: outcome([issue(), issue('ISS-B', ['R3'], [['D3']])], [correct], 10, { tp: 1, fp: 0, fn: 1, precision: 1, recall: 0.5, f1: 2 / 3, reward: 47 / 150 }),
+    C14_false_positive_penalty: outcome([issue(), issue('ISS-B', ['R3'], [['D3']])], [correct, finding({ type: 'unknown_type' })], 10, { tp: 1, fp: 1, fn: 1, precision: 0.5, recall: 0.5, f1: 0.5, reward: -0.02 }),
+    C15_zero_inspection_reward: equalScore(scoreFindings(baseTruth, [correct], 0, available), { tp: 1, fp: 0, fn: 0, precision: 1, recall: 1, f1: 1, reward: 1 }),
+    C16_fifty_step_reward: equalScore(scoreFindings(baseTruth, [correct], 50, available), { tp: 1, fp: 0, fn: 0, precision: 1, recall: 1, f1: 1, reward: 0.9 }),
+    C17_hundred_step_reward: equalScore(scoreFindings(baseTruth, [correct], 100, available), { tp: 1, fp: 0, fn: 0, precision: 1, recall: 1, f1: 1, reward: 0.8 }),
+    C18_finding_limit: invalidPayload(Array.from({ length: 31 }, () => correct)),
+    C19_evidence_limit_before_dedup: invalidPayload([finding({ evidence_ids: Array(11).fill('D1') })]),
+    C20_unicode_codepoint_limit: invalidPayload([finding({ explanation: '😀'.repeat(1001) })]),
+    M01_affected_ids_are_a_set: outcome(baseTruth, [finding({ affected_ids: ['R2', 'R1', 'R1'] })], 10, onePerfect),
+    M02_extra_affected_id_blocks_match: outcome(baseTruth, [finding({ affected_ids: ['R1', 'R2', 'R3'] })], 10, noMatch),
+    M03_extra_available_evidence_is_allowed: outcome(baseTruth, [finding({ evidence_ids: ['D2', 'D1', 'D3'] })], 10, onePerfect),
+    M04_extra_unavailable_evidence_blocks_match: outcome(baseTruth, [finding({ evidence_ids: ['D1', 'D2', 'U'] })], 10, noMatch),
+    M05_duplicate_ids_do_not_bypass_input_limit: invalidPayload([finding({ evidence_ids: Array(11).fill('D1') })]),
+    M06_currency_whitespace_is_not_trimmed: outcome(baseTruth, [finding({ currency: 'KZT ' })], 10, noMatch),
+    M07_minor_unit_difference_fails_at_zero_tolerance: outcome(baseTruth, [finding({ claimed_amount_minor: 10001 })], 10, noMatch),
+    M08_tolerance_boundary_is_inclusive: outcome(baseTruth, [finding({ claimed_amount_minor: 10001 })], 10, onePerfect, 1) && outcome(baseTruth, [finding({ claimed_amount_minor: 10002 })], 10, noMatch, 1),
+    M09_boolean_and_string_amounts_are_structural_errors: invalidPayload([finding({ claimed_amount_minor: true as unknown as number })]) && invalidPayload([finding({ claimed_amount_minor: '10000' as unknown as number })]),
+    M10_maximum_matching_avoids_greedy_loss: (() => {
+      const truth = [issue('ISS-A', ['R1', 'R2'], [['D1', 'D2']]), issue('ISS-B', ['R1', 'R2'], [['D3', 'D4']])]
+      const broad = finding({ evidence_ids: ['D1', 'D2', 'D3', 'D4'] })
+      const narrow = finding({ evidence_ids: ['D1', 'D2'] })
+      return scoreFindings(truth, [broad, narrow], 10, available).tp === 2
+    })(),
+    M11_ambiguous_matching_is_deterministic: (() => {
+      const truth = [issue('ISS-A', ['R1', 'R2'], [['D1', 'D2']]), issue('ISS-B', ['R1', 'R2'], [['D3', 'D4']])]
+      const both = finding({ evidence_ids: ['D1', 'D2', 'D3', 'D4'] })
+      const forward = scoreFindings(truth, [both, both], 10, available)
+      const reversed = scoreFindings(truth, [both, both].reverse(), 10, available)
+      return forward.tp === 2 && forward.fp === 0 && forward.fn === 0 && forward.reward === reversed.reward
+    })(),
+    M12_duplicate_finding_remains_false_positive: outcome(baseTruth, [correct, correct], 10, { tp: 1, fp: 1, fn: 0, precision: 0.5, recall: 1, f1: 2 / 3, reward: 47 / 150 }),
+  }
+  return { passed: Object.values(checks).filter(Boolean).length, total: Object.keys(checks).length, checks }
 }
 
 function knownIds(session: Session): Set<string> {
@@ -621,7 +724,7 @@ export function getSessionSnapshot(sessionId: string) {
   return { episode_id: session.episodeId, step_count: session.stepCount, terminated: session.terminated, truncated: session.truncated, ledger: session.data.ledger, invoices: session.data.invoices, payments: session.data.payments, fx: session.data.fx }
 }
 
-function evaluateHeuristic(data: GeneratedEpisode, seed: number | string) {
+function evaluateHeuristic(data: PolicyDataset) {
   const findings: Finding[] = []
   const add = (type: ErrorType, ids: string[], amount: number, currency: string, evidence: string[], explanation: string) => {
     findings.push({ type, affected_ids: ids, claimed_amount_minor: amount, currency, evidence_ids: evidence, explanation })
@@ -656,7 +759,7 @@ function evaluateHeuristic(data: GeneratedEpisode, seed: number | string) {
       if (!expectedRate || expectedRate.record_id !== fx.record_id) continue
       const fxRows = data.ledger.filter((row) => row.payment_id === payment.payment_id && row.currency === 'USD' && (row.account === 'Foreign exchange clearing' || row.account === 'Cash'))
       if (!fxRows.some((row) => row.account === 'Foreign exchange clearing')) continue
-      const expectedBase = Math.round(payment.amount_minor * Number(expectedRate.rate))
+      const expectedBase = convertMinorUnits(payment.amount_minor, expectedRate.rate)
       const recordedBase = fxRows.reduce((sum, row) => sum + row.debit_minor + row.credit_minor, 0) / 2
       if (recordedBase !== expectedBase) {
         const invoiceId = payment.invoice_refs[0]?.invoice_id
@@ -676,8 +779,20 @@ function evaluateHeuristic(data: GeneratedEpisode, seed: number | string) {
   return findings.slice(0, 30)
 }
 
+export function reconciliationFindings(data: PolicyDataset) {
+  return evaluateHeuristic(data)
+}
+
+export function randomFindingsFromObservation(data: PolicyDataset, episodeId: string) {
+  const random = randomFor(episodeId)
+  const candidates = data.ledger.slice(0, 8)
+  if (random() > 0.7 || !candidates.length) return []
+  const row = candidates[Math.floor(random() * candidates.length)]
+  return [{ type: ERROR_TYPES[Math.floor(random() * ERROR_TYPES.length)], affected_ids: [row.row_id], claimed_amount_minor: row.debit_minor || row.credit_minor, currency: row.currency, evidence_ids: [row.row_id], explanation: 'Seeded random policy candidate.' }] satisfies Finding[]
+}
+
 function potentialSignals(data: GeneratedEpisode) {
-  const findings = evaluateHeuristic(data, 'signal-scan')
+  const findings = evaluateHeuristic(data)
   const byType = Object.fromEntries(ERROR_TYPES.map((type) => [type, findings.filter((finding) => finding.type === type).length])) as Record<ErrorType, number>
   const reconciledSplitPayments = data.invoices.filter((invoice) => {
     const payments = data.payments.filter((payment) => payment.invoice_refs.some((reference) => reference.invoice_id === invoice.invoice_id))
@@ -698,6 +813,15 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
   const aggregate = new Map<string, { tp: number; fp: number; fn: number; reward: number; steps: number }>()
   const coverage = Object.fromEntries(ERROR_TYPES.map((type) => [type, { episodes: 0, findings: 0 }])) as Record<ErrorType, { episodes: number; findings: number }>
   const policies = ['random', 'reconciliation', 'mark_all', 'oracle'] as const
+  const scenarioMatrix = [
+    { id: 'clean', episodes: 5, cases: ['ordinary', 'split_payment', 'reversal', 'repeated_amounts', 'policy_boundary'] },
+    { id: 'duplicate_invoice', episodes: 3 },
+    { id: 'payment_allocation', episodes: 3, cases: ['missing', 'partial', 'partial'] },
+    { id: 'fx_date_rate', episodes: 2 },
+    { id: 'period_cutoff', episodes: 2 },
+    { id: 'partial_fx', episodes: 3 },
+    { id: 'fx_period', episodes: 2 },
+  ]
   const started = Date.now()
   const benchmarkSessionIds: string[] = []
   let pairedChecksPassed = 0
@@ -710,14 +834,42 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
     unsupported_evidence_rejected: false,
     wrong_currency_rejected: false,
     amount_tolerance_is_explicit: false,
+    evidence_ids_use_set_semantics: false,
+    affected_ids_use_set_semantics: false,
+    unknown_string_types_are_nonmatching: false,
+    fx_decimal_strings_use_integer_rounding: false,
   }
+  adversarialChecks.fx_decimal_strings_use_integer_rounding = convertMinorUnits(100, '0.0150') === 2 && convertMinorUnits(100, '0.0149') === 1
+  const matcherContractChecks = runMatcherContractChecks()
   for (let index = 0; index < episodeCount; index++) {
-    const cleanCount = Math.floor(episodeCount / 4)
-    const interactionCount = Math.floor(episodeCount / 4)
+    const cleanCount = 5
+    const interactionCount = 5
     const clean = index < cleanCount
-    const isInteraction = index >= cleanCount && index < cleanCount + interactionCount
-    const interaction = isInteraction ? [index % 2 === 0 ? 'partial_fx' : 'fx_period'] as InteractionScenario[] : []
-    const reset = resetEpisode(`${firstSeed}-${index}`, { mode: 'train', includeClean: true, interactions: interaction, errorTypes: clean ? Object.fromEntries(ERROR_TYPES.map((type) => [type, false])) as Record<ErrorType, boolean> : undefined })
+    const errorTypes = Object.fromEntries(ERROR_TYPES.map((type) => [type, false])) as Record<ErrorType, boolean>
+    let interactions: InteractionScenario[] = []
+    let cleanScenario: CleanScenario | undefined
+    let paymentAllocationMode: EpisodeConfig['paymentAllocationMode']
+    if (index < 5) {
+      cleanScenario = (['ordinary', 'split_payment', 'reversal', 'repeated_amounts', 'policy_boundary'] as const)[index]
+    } else if (index < 8) {
+      errorTypes.duplicate_invoice = true
+    } else if (index < 11) {
+      errorTypes.payment_allocation = true
+      paymentAllocationMode = index === 8 ? 'missing' : 'partial'
+    } else if (index < 13) {
+      errorTypes.fx_date_rate = true
+    } else if (index < 15) {
+      errorTypes.period_cutoff = true
+    } else if (index < 18) {
+      errorTypes.payment_allocation = true
+      errorTypes.fx_date_rate = true
+      interactions = ['partial_fx']
+    } else {
+      errorTypes.fx_date_rate = true
+      errorTypes.period_cutoff = true
+      interactions = ['fx_period']
+    }
+    const reset = resetEpisode(`${firstSeed}-${index}`, { mode: 'train', includeClean: true, interactions, errorTypes, cleanScenario, paymentAllocationMode })
     benchmarkSessionIds.push(reset.session_id)
     const session = sessions.get(reset.session_id)!
     for (const type of ERROR_TYPES) {
@@ -730,13 +882,13 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
       let findings: Finding[]
       let steps = 1
       if (policy === 'oracle') findings = createOracleFindings(sessionClone)
-      else if (policy === 'reconciliation') { findings = evaluateHeuristic(sessionClone.data, `${firstSeed}-${index}`); steps = Math.min(20, 4 + sessionClone.data.invoices.length) }
+      else if (policy === 'reconciliation') { findings = evaluateHeuristic(sessionClone.data); steps = Math.min(20, 4 + sessionClone.data.invoices.length) }
       else if (policy === 'random') { findings = []; steps = 1 + Math.floor(randomFor(`${firstSeed}-${index}-random`)() * 15) }
       else {
         findings = sessionClone.data.ledger.slice(0, MAX_FINDINGS).map((row) => ({ type: 'duplicate_invoice' as const, affected_ids: [row.row_id], claimed_amount_minor: row.debit_minor || row.credit_minor, currency: row.currency, evidence_ids: [row.row_id], explanation: 'Flag every record.' }))
         steps = 1
       }
-      const score = scoreFindings(sessionClone.data.truth, findings, steps)
+      const score = scoreFindings(sessionClone.data.truth, findings, steps, knownIds(sessionClone), sessionClone.config.amountToleranceMinor ?? 0)
       const current = aggregate.get(policy) ?? { tp: 0, fp: 0, fn: 0, reward: 0, steps: 0 }
       current.tp += score.tp; current.fp += score.fp; current.fn += score.fn; current.reward += score.reward; current.steps += steps
       aggregate.set(policy, current)
@@ -758,9 +910,9 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
       }))
       const remappedAvailable = new Set(allIds.map((id) => remap.get(id)!))
       const paired = scoreFindings(remappedTruth, remappedFindings, 12, remappedAvailable)
-      const originalHeuristic = scoreFindings(session.data.truth, evaluateHeuristic(session.data, firstSeed), 12, knownIds(session))
+      const originalHeuristic = scoreFindings(session.data.truth, evaluateHeuristic(session.data), 12, knownIds(session))
       const reorderedData: GeneratedEpisode = { ...session.data, ledger: [...session.data.ledger].reverse(), invoices: [...session.data.invoices].reverse(), payments: [...session.data.payments].reverse(), fx: [...session.data.fx].reverse() }
-      const reorderedHeuristic = scoreFindings(session.data.truth, evaluateHeuristic(reorderedData, firstSeed), 12, knownIds(session))
+      const reorderedHeuristic = scoreFindings(session.data.truth, evaluateHeuristic(reorderedData), 12, knownIds(session))
       if (original.tp === paired.tp && original.fp === paired.fp && original.fn === paired.fn && original.f1 === paired.f1 && originalHeuristic.tp === reorderedHeuristic.tp && originalHeuristic.fp === reorderedHeuristic.fp && originalHeuristic.fn === reorderedHeuristic.fn && originalHeuristic.f1 === reorderedHeuristic.f1) pairedChecksPassed++
     }
     if (index === 0) {
@@ -778,6 +930,14 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
       const unsupportedEvidence = oracle.map((finding) => ({ ...finding, evidence_ids: ['NOT-AVAILABLE'] }))
       const wrongCurrency = oracle.map((finding) => ({ ...finding, currency: 'ZZZ' }))
       const oneMinorOff = oracle.map((finding, findingIndex) => findingIndex === 0 ? { ...finding, claimed_amount_minor: finding.claimed_amount_minor + 1 } : finding)
+      const repeatedEvidence = oracle.map((finding, findingIndex) => findingIndex === 0 ? { ...finding, evidence_ids: [...finding.evidence_ids, finding.evidence_ids[0]] } : finding)
+      const repeatedAffected = oracle.map((finding, findingIndex) => findingIndex === 0 ? { ...finding, affected_ids: [...finding.affected_ids, finding.affected_ids[0]] } : finding)
+      const unknownType = oracle.map((finding) => ({ ...finding, type: 'unknown_but_well_formed' }))
+      const repeatedEvidenceScore = scoreFindings(session.data.truth, repeatedEvidence, 12, available)
+      const repeatedAffectedScore = scoreFindings(session.data.truth, repeatedAffected, 12, available)
+      adversarialChecks.evidence_ids_use_set_semantics = repeatedEvidenceScore.tp === correct.tp && repeatedEvidenceScore.fp === correct.fp && repeatedEvidenceScore.fn === correct.fn
+      adversarialChecks.affected_ids_use_set_semantics = repeatedAffectedScore.tp === correct.tp && repeatedAffectedScore.fp === correct.fp && repeatedAffectedScore.fn === correct.fn
+      adversarialChecks.unknown_string_types_are_nonmatching = scoreFindings(session.data.truth, unknownType, 12, available).tp === 0
       adversarialChecks.amount_tolerance_is_explicit = scoreFindings(session.data.truth, oneMinorOff, 12, available).f1 < correct.f1 && scoreFindings(session.data.truth, oneMinorOff, 12, available, 1).f1 === correct.f1
       adversarialChecks.oracle_beats_silence = correct.f1 > silent.f1
       adversarialChecks.duplicate_findings_do_not_gain = duplicate.f1 < correct.f1
@@ -794,7 +954,7 @@ export function runBaselines(options: { seed?: number | string; episodes?: numbe
     const f1 = result.tp === 0 && result.fp === 0 && result.fn === 0 ? 1 : (2 * result.tp) / (2 * result.tp + result.fp + result.fn)
     return { policy, episodes: episodeCount, precision, recall, f1, mean_reward: result.reward / episodeCount, mean_steps: result.steps / episodeCount }
   })
-  return { benchmark_id: `BENCH-${seedNumber(firstSeed).toString(16)}`, seed: firstSeed, protocol_version: '1.0', dataset_version: '1.0', policy_version: '1.0', runtime: { node: process.version, platform: process.platform, arch: process.arch, cpu_threads: availableParallelism(), total_memory_bytes: totalmem() }, episodes: episodeCount, clean_episodes: Math.floor(episodeCount / 4), interacting_episodes: Math.floor(episodeCount / 4), paired_checks: pairedCheckCount, paired_checks_passed: pairedChecksPassed, coverage_by_type: coverage, adversarial_checks: adversarialChecks, elapsed_ms: Date.now() - started, policies: results }
+  return { benchmark_id: `BENCH-${seedNumber(firstSeed).toString(16)}`, seed: firstSeed, protocol_version: '1.0', dataset_version: '1.0', policy_version: '1.0', runtime: { node: process.version, platform: process.platform, arch: process.arch, cpu_threads: availableParallelism(), total_memory_bytes: totalmem() }, episodes: episodeCount, clean_episodes: Math.floor(episodeCount / 4), interacting_episodes: Math.floor(episodeCount / 4), scenario_matrix: scenarioMatrix, paired_checks: pairedCheckCount, paired_checks_passed: pairedChecksPassed, coverage_by_type: coverage, adversarial_checks: adversarialChecks, matcher_contract_checks: matcherContractChecks, elapsed_ms: Date.now() - started, policies: results }
 }
 
 export function inspectEpisode(sessionId: string) {
@@ -804,10 +964,16 @@ export function inspectEpisode(sessionId: string) {
   return { episode_id: session.episodeId, manifest: session.data.manifest, ledger: session.data.ledger, invoices: session.data.invoices, payments: session.data.payments, fx: session.data.fx, policy: session.data.policy, ...(potential ? { potential_count: potential.count, potential_by_type: potential.byType } : {}), step_count: session.stepCount, remaining_steps: Math.max(0, MAX_STEPS - session.stepCount), terminated: session.terminated, truncated: session.truncated }
 }
 
+export function getEpisodeObservation(sessionId: string) {
+  const session = sessions.get(sessionId)
+  if (!session) throw new Error('Episode session not found or expired.')
+  return baseObservation(session)
+}
+
 export function baselineFindings(sessionId: string, policy: 'random' | 'reconciliation' | 'mark_all') {
   const session = sessions.get(sessionId)
   if (!session) throw new Error('Episode session not found or expired.')
-  if (policy === 'reconciliation') return evaluateHeuristic(session.data, session.seed)
+  if (policy === 'reconciliation') return evaluateHeuristic(session.data)
   if (policy === 'random') {
     const rand = randomFor(`${session.seed}-random-policy`)
     const candidates = session.data.ledger.slice(0, 8)
