@@ -95,6 +95,19 @@ def assert_protocol(base: str) -> None:
     assert "score" not in closed["observation"].get("result", {}), "Closed submissions must withhold evaluator score"
     print("PASS closed submission with withheld score")
 
+    with urllib.request.urlopen(f"{base}/api/simulator?session_id={session_id}", timeout=10) as response:
+        trajectory = response.read().decode("utf-8").splitlines()
+        assert response.headers.get_content_type() == "application/x-ndjson", "Trajectory export must use NDJSON"
+    assert trajectory and all(isinstance(json.loads(line), dict) for line in trajectory), "Trajectory export must contain valid JSON objects"
+    print("PASS trajectory download format and JSONL validity")
+
+    try:
+        request(base, "reset", seed="invalid-config", config={"amountToleranceMinor": -1})
+        raise AssertionError("Negative amount tolerance must be rejected")
+    except urllib.error.HTTPError as error:
+        assert error.code == 400, "Invalid configuration must return HTTP 400"
+    print("PASS invalid configuration validation")
+
     training = request(base, "reset", seed="official-check-training", config={"mode": "train"})
     invalid_submit = request(base, "step", session_id=training["session_id"], action={"type": "submit", "findings": {}})
     assert invalid_submit["terminated"] and invalid_submit["reward"] == -1, "Invalid training submissions must terminate with -1"
