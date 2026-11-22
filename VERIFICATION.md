@@ -15,7 +15,7 @@ Install project dependencies once, then run:
 pnpm verify:offline
 ```
 
-The checker reuses a healthy local simulator on port 3000 or starts and stops a temporary development server. It uses only loopback HTTP and makes no external API calls or credential requests. The benchmark checks 20 fixed-seed episodes, including five clean and five interacting-error episodes, runs the same four baselines on each episode, and verifies 20 paired record-order/ID-renaming checks.
+The checker reuses a healthy local simulator on port 3000 or starts and stops a temporary development server. It uses only loopback HTTP and makes no external API calls or credential requests. It covers deterministic reset/privacy, stable cursor pagination, bounded action accounting, safe decimal calculation, matcher type/currency/ID/evidence semantics and limits, Unicode explanation length, and the 99-inspection-plus-submit / 100-inspection boundaries. The matcher is checked against all 20 published score/structure vectors and the 12 M01-M12 normalization examples. The benchmark follows the Genesis FinTech scenario matrix: five distinct clean cases, three duplicate cases, three allocation cases (one missing and two partial), two FX cases, two cutoff cases, and five interaction cases. It runs the same four baselines on all 20 fixed-seed episodes and verifies 20 paired record-order/ID-renaming checks.
 
 ## Container
 

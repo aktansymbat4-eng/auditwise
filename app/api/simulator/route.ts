@@ -1,12 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
 import {
-  baselineFindings,
+  getEpisodeObservation,
   inspectEpisode,
+  randomFindingsFromObservation,
+  reconciliationFindings,
   resetEpisode,
   runBaselines,
   stepEpisode,
   trajectoryJsonl,
   type EpisodeConfig,
+  type FxRecord,
+  type InvoiceDocument,
+  type LedgerRecord,
+  type PaymentDocument,
+  type PolicyDataset,
   type SimulatorAction,
 } from '@/lib/audit-simulator'
 
@@ -41,18 +48,28 @@ export async function POST(request: NextRequest) {
     if (body.operation === 'run_policy') {
       if (typeof body.session_id !== 'string') return publicError('A session ID is required.')
       const policy = body.policy === 'random' ? 'random' : 'reconciliation'
-      const initial = inspectEpisode(body.session_id)
-      const tableSizes = { ledger: initial.ledger.length, invoices: initial.invoices.length, payments: initial.payments.length, fx: initial.fx.length }
-      for (const [table, count] of Object.entries(tableSizes) as Array<[keyof typeof tableSizes, number]>) {
-        const pages = Math.max(1, Math.ceil(count / 50))
-        for (let page = 0; page < pages; page++) {
-          stepEpisode(body.session_id, { type: 'list_records', table, cursor: page ? String(page * 50) : null, limit: 50 })
-        }
+      const initial = getEpisodeObservation(body.session_id)
+      const policyData: PolicyDataset = { manifest: initial.manifest, policy: initial.policy, ledger: [], invoices: [], payments: [], fx: [] }
+      for (const table of ['ledger', 'invoices', 'payments', 'fx'] as const) {
+        let cursor: string | null = null
+        do {
+          const page = stepEpisode(body.session_id, { type: 'list_records', table, cursor, limit: 50 })
+          const result = page.observation.result as { records?: unknown; next_cursor?: unknown } | undefined
+          if (page.truncated || page.observation.error || !result || !Array.isArray(result.records)) throw new Error('Policy could not read the available record pages.')
+          if (table === 'ledger') policyData.ledger.push(...result.records as LedgerRecord[])
+          else if (table === 'invoices') policyData.invoices.push(...result.records as InvoiceDocument[])
+          else if (table === 'payments') policyData.payments.push(...result.records as PaymentDocument[])
+          else policyData.fx.push(...result.records as FxRecord[])
+          if (result.next_cursor !== null && typeof result.next_cursor !== 'string') throw new Error('Policy received an invalid page cursor.')
+          cursor = result.next_cursor
+        } while (cursor !== null)
       }
-      const findings = policy === 'random' ? baselineFindings(body.session_id, 'random') : baselineFindings(body.session_id, 'reconciliation')
+      const findings = policy === 'random'
+        ? randomFindingsFromObservation(policyData, initial.episode_id)
+        : reconciliationFindings(policyData)
       const affectedIds = [...new Set(findings.flatMap((finding) => finding.affected_ids))].slice(0, 35)
       for (const id of affectedIds) {
-        if (inspectEpisode(body.session_id).remaining_steps <= 2) break
+        if (getEpisodeObservation(body.session_id).remaining_steps <= 2) break
         stepEpisode(body.session_id, { type: 'get_record', table: 'ledger', id })
       }
       if (body.submit === true) {
